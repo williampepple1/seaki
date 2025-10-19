@@ -5,6 +5,10 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::Mutex;
 use warp::Filter;
+use uuid::Uuid;
+use chrono::Utc;
+use std::net::IpAddr;
+use warp::reject::Rejection;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInfo {
@@ -21,10 +25,26 @@ pub struct ServerStatus {
     pub files: Vec<FileInfo>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionRequest {
+    pub device_name: String,
+    pub device_ip: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTransferRequest {
+    pub file_name: String,
+    pub file_size: u64,
+    pub sender_name: String,
+    pub sender_ip: String,
+}
+
 pub struct FileServer {
     pub port: u16,
     pub device_name: String,
     pub files: Arc<Mutex<HashMap<String, FileInfo>>>,
+    pub pending_connections: Arc<Mutex<Vec<crate::IncomingConnection>>>,
+    pub pending_files: Arc<Mutex<Vec<crate::IncomingFile>>>,
 }
 
 impl FileServer {
@@ -36,6 +56,8 @@ impl FileServer {
             port,
             device_name,
             files: Arc::new(Mutex::new(HashMap::new())),
+            pending_connections: Arc::new(Mutex::new(Vec::new())),
+            pending_files: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -43,6 +65,12 @@ impl FileServer {
         let files = self.files.clone();
         let device_name = self.device_name.clone();
         let port = self.port;
+        
+        // Get local IP for network validation
+        let local_ip = match local_ip_address::local_ip() {
+            Ok(ip) => ip,
+            Err(_) => return Err("Failed to get local IP".to_string()),
+        };
 
         // API routes
         let status = warp::path("api")
@@ -81,7 +109,57 @@ impl FileServer {
                 }
             });
 
-        let routes = status.or(upload).or(download);
+        let connection_request = warp::path("api")
+            .and(warp::path("connect"))
+            .and(warp::post())
+            .and(warp::body::json())
+            .and_then(move |request: ConnectionRequest| {
+                let pending_connections = self.pending_connections.clone();
+                async move {
+                    handle_connection_request(request, pending_connections).await
+                }
+            });
+
+        let file_transfer_request = warp::path("api")
+            .and(warp::path("transfer"))
+            .and(warp::post())
+            .and(warp::body::json())
+            .and_then(move |request: FileTransferRequest| {
+                let pending_files = self.pending_files.clone();
+                async move {
+                    handle_file_transfer_request(request, pending_files).await
+                }
+            });
+
+        // Add network validation middleware
+        let network_filter = warp::any()
+            .and(warp::header::optional::<String>("x-forwarded-for"))
+            .and(warp::header::optional::<String>("x-real-ip"))
+            .map(|forwarded: Option<String>, real_ip: Option<String>| {
+                // Extract client IP from headers or use remote address
+                let client_ip = forwarded
+                    .or(real_ip)
+                    .unwrap_or_else(|| "127.0.0.1".to_string());
+                client_ip
+            })
+            .and_then(move |client_ip: String| {
+                let local_ip = local_ip.clone();
+                async move {
+                    // Check if client is from same network
+                    if is_same_network(&client_ip, &local_ip) {
+                        Ok(client_ip)
+                    } else {
+                        Err(warp::reject::custom(NetworkRejection))
+                    }
+                }
+            });
+
+        let routes = status
+            .or(upload)
+            .or(download)
+            .or(connection_request)
+            .or(file_transfer_request)
+            .with(network_filter);
 
         println!("Starting server on port {}", port);
         warp::serve(routes)
@@ -199,4 +277,98 @@ async fn handle_download(
             ))
         }
     }
+}
+
+async fn handle_connection_request(
+    request: ConnectionRequest,
+    pending_connections: Arc<Mutex<Vec<crate::IncomingConnection>>>,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    let connection = crate::IncomingConnection {
+        id: Uuid::new_v4().to_string(),
+        device_name: request.device_name,
+        device_ip: request.device_ip,
+        timestamp: Utc::now(),
+    };
+
+    {
+        let mut connections_guard = pending_connections.lock().await;
+        connections_guard.push(connection.clone());
+    }
+
+    // TODO: Send notification to UI
+    println!("New connection request from: {} ({})", connection.device_name, connection.device_ip);
+
+    Ok(warp::reply::json(&serde_json::json!({
+        "success": true,
+        "message": "Connection request sent",
+        "connection_id": connection.id
+    })))
+}
+
+async fn handle_file_transfer_request(
+    request: FileTransferRequest,
+    pending_files: Arc<Mutex<Vec<crate::IncomingFile>>>,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    let file = crate::IncomingFile {
+        id: Uuid::new_v4().to_string(),
+        file_name: request.file_name,
+        file_size: request.file_size,
+        sender_name: request.sender_name,
+        sender_ip: request.sender_ip,
+        timestamp: Utc::now(),
+    };
+
+    {
+        let mut files_guard = pending_files.lock().await;
+        files_guard.push(file.clone());
+    }
+
+    // TODO: Send notification to UI
+    println!("New file transfer request: {} from {} ({})", 
+        file.file_name, file.sender_name, file.sender_ip);
+
+    Ok(warp::reply::json(&serde_json::json!({
+        "success": true,
+        "message": "File transfer request sent",
+        "file_id": file.id
+    })))
+}
+
+// Network security functions
+#[derive(Debug)]
+struct NetworkRejection;
+
+impl warp::reject::Reject for NetworkRejection {}
+
+fn is_same_network(client_ip: &str, local_ip: &IpAddr) -> bool {
+    // Parse client IP
+    let client_ip: IpAddr = match client_ip.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+
+    // Allow localhost connections
+    if client_ip.is_loopback() {
+        return true;
+    }
+
+    // Check if both IPs are IPv4 and in same subnet
+    if let (IpAddr::V4(client_v4), IpAddr::V4(local_v4)) = (client_ip, local_ip) {
+        // Check if they're in the same /24 subnet (same network)
+        let client_network = u32::from(client_v4) & 0xFFFFFF00; // /24 mask
+        let local_network = u32::from(local_v4) & 0xFFFFFF00; // /24 mask
+        
+        return client_network == local_network;
+    }
+
+    // For IPv6, check if they're in the same /64 subnet
+    if let (IpAddr::V6(client_v6), IpAddr::V6(local_v6)) = (client_ip, local_ip) {
+        let client_bytes = client_v6.octets();
+        let local_bytes = local_v6.octets();
+        
+        // Check first 8 bytes (64 bits) are the same
+        return client_bytes[..8] == local_bytes[..8];
+    }
+
+    false
 }
