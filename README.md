@@ -50,6 +50,16 @@ npm install
 npm run tauri dev
 ```
 
+**Windows Users**: You can also use the provided batch file:
+```bash
+start-dev.bat
+```
+
+**Linux/Mac Users**: You can use the provided shell script:
+```bash
+./start-dev.sh
+```
+
 ### Building for Production
 
 ```bash

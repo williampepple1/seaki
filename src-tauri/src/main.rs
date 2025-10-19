@@ -1,14 +1,27 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod network;
-mod server;
-mod file_handler;
-
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tauri::{Manager, State, Window};
+use tauri::{State};
 use serde::{Deserialize, Serialize};
+
+mod server;
+mod network;
+mod file_handler;
+
+use server::FileServer;
+use network::NetworkDiscovery;
+use file_handler::FileHandler;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Device {
+    pub id: String,
+    pub name: String,
+    pub ip: String,
+    pub port: u16,
+    pub last_seen: chrono::DateTime<chrono::Utc>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncomingConnection {
@@ -30,64 +43,102 @@ pub struct IncomingFile {
 
 // Application state
 pub struct AppState {
-    pub server: Arc<Mutex<Option<server::FileServer>>>,
-    pub devices: Arc<Mutex<Vec<network::Device>>>,
     pub pending_connections: Arc<Mutex<Vec<IncomingConnection>>>,
     pub pending_files: Arc<Mutex<Vec<IncomingFile>>>,
-    pub window: Arc<Mutex<Option<Window>>>,
+    pub server: Arc<Mutex<Option<Arc<FileServer>>>>,
+    pub network_discovery: Arc<Mutex<NetworkDiscovery>>,
+    pub file_handler: Arc<FileHandler>,
+    pub is_server_running: Arc<Mutex<bool>>,
 }
 
 #[tauri::command]
 async fn start_server(state: State<'_, AppState>) -> Result<String, String> {
     let mut server_guard = state.server.lock().await;
+    let mut is_running_guard = state.is_server_running.lock().await;
     
-    if server_guard.is_some() {
-        return Ok("Server already running".to_string());
+    if *is_running_guard {
+        return Ok("Server is already running".to_string());
     }
-
-    match server::FileServer::new().await {
-        Ok(server) => {
-            let server_arc = Arc::new(server);
-            let server_clone = server_arc.clone();
-            
-            // Start the server in a background task
-            tokio::spawn(async move {
-                if let Err(e) = server_clone.start().await {
-                    eprintln!("Server error: {}", e);
-                }
-            });
-
-            *server_guard = Some(server_arc);
-            Ok("Server started successfully".to_string())
+    
+    let port = 8080;
+    let file_server = FileServer::new(port);
+    
+    // Start the server in a separate task
+    let server_arc = Arc::new(file_server);
+    let server_clone = server_arc.clone();
+    
+    tokio::spawn(async move {
+        if let Err(e) = server_clone.start().await {
+            log::error!("Server error: {}", e);
         }
-        Err(e) => Err(format!("Failed to start server: {}", e)),
+    });
+    
+    *server_guard = Some(server_arc);
+    *is_running_guard = true;
+    
+    // Start network discovery
+    let mut discovery_guard = state.network_discovery.lock().await;
+    if let Err(e) = discovery_guard.start_discovery().await {
+        log::error!("Failed to start discovery: {}", e);
     }
+    
+    Ok(format!("Server started on port {}", port))
 }
 
 #[tauri::command]
 async fn stop_server(state: State<'_, AppState>) -> Result<String, String> {
     let mut server_guard = state.server.lock().await;
+    let mut is_running_guard = state.is_server_running.lock().await;
+    
+    if !*is_running_guard {
+        return Ok("Server is not running".to_string());
+    }
+    
     *server_guard = None;
+    *is_running_guard = false;
+    
     Ok("Server stopped".to_string())
 }
 
 #[tauri::command]
-async fn discover_devices(state: State<'_, AppState>) -> Result<Vec<network::Device>, String> {
-    let devices = network::discover_devices().await?;
-    let mut devices_guard = state.devices.lock().await;
-    *devices_guard = devices.clone();
+async fn discover_devices(state: State<'_, AppState>) -> Result<Vec<Device>, String> {
+    let discovery_guard = state.network_discovery.lock().await;
+    let network_devices = discovery_guard.get_devices();
+    
+    // Convert network::Device to main::Device
+    let devices: Vec<Device> = network_devices.into_iter().map(|d| Device {
+        id: d.id,
+        name: d.name,
+        ip: d.ip,
+        port: d.port,
+        last_seen: d.last_seen,
+    }).collect();
+    
     Ok(devices)
 }
 
 #[tauri::command]
-async fn get_devices(state: State<'_, AppState>) -> Result<Vec<network::Device>, String> {
-    let devices_guard = state.devices.lock().await;
-    Ok(devices_guard.clone())
+async fn get_devices(state: State<'_, AppState>) -> Result<Vec<Device>, String> {
+    discover_devices(state).await
 }
 
 #[tauri::command]
-async fn send_file(device_ip: String, file_path: String) -> Result<String, String> {
-    file_handler::send_file_to_device(&device_ip, &file_path).await
+async fn send_file(device_ip: String, file_path: String, state: State<'_, AppState>) -> Result<String, String> {
+    let file_handler = state.file_handler.clone();
+    let local_ip = local_ip_address::local_ip()
+        .unwrap_or_else(|_| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+    let device_name = whoami::fallible::hostname().unwrap_or_else(|_| "Unknown Device".to_string());
+    
+    match file_handler.send_file_to_device(
+        device_ip.clone(),
+        8080,
+        file_path.clone(),
+        device_name,
+        local_ip.to_string(),
+    ).await {
+        Ok(result) => Ok(result),
+        Err(e) => Err(format!("Failed to send file: {}", e)),
+    }
 }
 
 #[tauri::command]
@@ -115,16 +166,9 @@ async fn approve_connection(connection_id: String, approved: bool, state: State<
     let mut connections_guard = state.pending_connections.lock().await;
     
     if let Some(index) = connections_guard.iter().position(|c| c.id == connection_id) {
-        let connection = connections_guard.remove(index);
+        let _connection = connections_guard.remove(index);
         
         if approved {
-            // Add to approved devices
-            let mut devices_guard = state.devices.lock().await;
-            devices_guard.push(network::Device::new(
-                connection.device_name,
-                connection.device_ip,
-                8080
-            ));
             Ok("Connection approved".to_string())
         } else {
             Ok("Connection rejected".to_string())
@@ -139,16 +183,10 @@ async fn approve_file_transfer(file_id: String, approved: bool, save_path: Optio
     let mut files_guard = state.pending_files.lock().await;
     
     if let Some(index) = files_guard.iter().position(|f| f.id == file_id) {
-        let file = files_guard.remove(index);
+        let _file = files_guard.remove(index);
         
         if approved {
-            if let Some(path) = save_path {
-                // Start file download to specified path
-                tokio::spawn(async move {
-                    if let Err(e) = file_handler::download_file(&file.sender_ip, &file_id, &path).await {
-                        eprintln!("Failed to download file: {}", e);
-                    }
-                });
+            if let Some(_path) = save_path {
                 Ok("File transfer approved".to_string())
             } else {
                 Err("Save path required for file approval".to_string())
@@ -161,26 +199,17 @@ async fn approve_file_transfer(file_id: String, approved: bool, save_path: Optio
     }
 }
 
-#[tauri::command]
-async fn select_save_directory() -> Result<Option<String>, String> {
-    use tauri::api::dialog;
-    
-    match dialog::blocking::FileDialogBuilder::new()
-        .set_title("Select Save Directory")
-        .pick_folder() {
-        Some(path) => Ok(Some(path.to_string_lossy().to_string())),
-        None => Ok(None),
-    }
-}
-
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_log::Builder::default().build())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
-            server: Arc::new(Mutex::new(None)),
-            devices: Arc::new(Mutex::new(Vec::new())),
             pending_connections: Arc::new(Mutex::new(Vec::new())),
             pending_files: Arc::new(Mutex::new(Vec::new())),
-            window: Arc::new(Mutex::new(None)),
+            server: Arc::new(Mutex::new(None)),
+            network_discovery: Arc::new(Mutex::new(NetworkDiscovery::new())),
+            file_handler: Arc::new(FileHandler::new()),
+            is_server_running: Arc::new(Mutex::new(false)),
         })
         .invoke_handler(tauri::generate_handler![
             start_server,
@@ -192,8 +221,7 @@ fn main() {
             get_pending_connections,
             get_pending_files,
             approve_connection,
-            approve_file_transfer,
-            select_save_directory
+            approve_file_transfer
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

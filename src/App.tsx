@@ -1,6 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/tauri';
-import { open } from '@tauri-apps/api/dialog';
+import { useState, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { Wifi, Upload, Download, RefreshCw, CheckCircle, AlertCircle, Shield, FileText, Clock, X } from 'lucide-react';
 
 interface Device {
@@ -11,12 +10,6 @@ interface Device {
   last_seen: string;
 }
 
-interface FileInfo {
-  name: string;
-  size: number;
-  mime_type: string;
-  hash: string;
-}
 
 interface IncomingConnection {
   id: string;
@@ -103,30 +96,6 @@ function App() {
     }
   };
 
-  const selectFile = async () => {
-    try {
-      const selected = await open({
-        multiple: false,
-        filters: [
-          {
-            name: 'All Files',
-            extensions: ['*']
-          }
-        ]
-      });
-      
-      if (selected && typeof selected === 'string') {
-        // Create a File object from the path
-        const response = await fetch(`file://${selected}`);
-        const blob = await response.blob();
-        const file = new File([blob], selected.split('/').pop() || 'unknown', { type: blob.type });
-        setSelectedFile(file);
-        setMessage({ type: 'success', text: `Selected file: ${file.name}` });
-      }
-    } catch (error) {
-      setMessage({ type: 'error', text: `Failed to select file: ${error}`});
-    }
-  };
 
   const sendFile = async () => {
     if (!selectedDevice || !selectedFile) {
@@ -193,12 +162,8 @@ function App() {
       let savePath: string | undefined;
       
       if (approved) {
-        const selectedPath = await invoke<string | null>('select_save_directory');
-        if (!selectedPath) {
-          setMessage({ type: 'error', text: 'Please select a save directory' });
-          return;
-        }
-        savePath = selectedPath;
+        // For now, use a default save path
+        savePath = "./downloads/";
       }
 
       const result = await invoke<string>('approve_file_transfer', {

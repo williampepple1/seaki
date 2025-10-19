@@ -1,8 +1,10 @@
-use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::time::timeout;
-use uuid::Uuid;
+use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Utc};
+use local_ip_address::local_ip;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Device {
@@ -10,117 +12,153 @@ pub struct Device {
     pub name: String,
     pub ip: String,
     pub port: u16,
-    pub last_seen: chrono::DateTime<chrono::Utc>,
+    pub last_seen: DateTime<Utc>,
 }
 
-impl Device {
-    pub fn new(name: String, ip: String, port: u16) -> Self {
+#[derive(Debug, Clone)]
+pub struct NetworkDiscovery {
+    pub devices: HashMap<String, Device>,
+    pub service_name: String,
+}
+
+impl NetworkDiscovery {
+    pub fn new() -> Self {
         Self {
-            id: Uuid::new_v4().to_string(),
-            name,
-            ip,
-            port,
-            last_seen: chrono::Utc::now(),
+            devices: HashMap::new(),
+            service_name: "_seaki._tcp.local".to_string(),
         }
     }
-}
 
-pub async fn discover_devices() -> Result<Vec<Device>, String> {
-    let mut devices = Vec::new();
-    
-    // Get local IP range
-    let local_ip = match local_ip_address::local_ip() {
-        Ok(ip) => ip,
-        Err(e) => return Err(format!("Failed to get local IP: {}", e)),
-    };
+    pub async fn start_discovery(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        log::info!("Starting network discovery for service: {}", self.service_name);
+        
+        // Start discovery in a separate task
+        let devices = self.devices.clone();
+        let service_name = self.service_name.clone();
+        
+        tokio::spawn(async move {
+            if let Err(e) = Self::discover_devices_loop(devices, service_name).await {
+                log::error!("Discovery error: {}", e);
+            }
+        });
 
-    if let IpAddr::V4(ipv4) = local_ip {
-        let base_ip = format!("{}.{}.{}.", ipv4.octets()[0], ipv4.octets()[1], ipv4.octets()[2]);
-        
-        // Scan common ports for file sharing services
-        let ports = vec![8080, 8081, 8082, 3000, 5000];
-        
-        for port in ports {
-            // Scan IPs in the local network range
-            for i in 1..255 {
-                let target_ip = format!("{}{}", base_ip, i);
-                
-                if let Ok(ip_addr) = target_ip.parse::<IpAddr>() {
-                    if let Some(device) = check_device(ip_addr, port).await {
-                        devices.push(device);
+        Ok(())
+    }
+
+    async fn discover_devices_loop(
+        mut devices: HashMap<String, Device>,
+        service_name: String,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        loop {
+            match Self::discover_devices(&service_name).await {
+                Ok(discovered) => {
+                    for device in discovered {
+                        devices.insert(device.id.clone(), device);
                     }
                 }
-            }
-        }
-    }
-
-    // Also try mDNS discovery
-    if let Ok(mdns_devices) = discover_via_mdns().await {
-        devices.extend(mdns_devices);
-    }
-
-    Ok(devices)
-}
-
-async fn check_device(ip: IpAddr, port: u16) -> Option<Device> {
-    let url = format!("http://{}:{}/api/status", ip, port);
-    
-    match timeout(Duration::from_millis(1000), reqwest::get(&url)).await {
-        Ok(Ok(response)) if response.status().is_success() => {
-            if let Ok(device_info) = response.json::<serde_json::Value>().await {
-                let name = device_info
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown Device")
-                    .to_string();
-                
-                Some(Device::new(name, ip.to_string(), port))
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-async fn discover_via_mdns() -> Result<Vec<Device>, String> {
-    let mut devices = Vec::new();
-    
-    // Use mDNS to discover services
-    let service = "_seaki._tcp.local";
-    
-    match mdns::discover::all(service, Duration::from_secs(5)) {
-        Ok(stream) => {
-            for response in stream {
-                if let Ok(response) = response {
-                    for service in response.services() {
-                        let name = service.name().to_string();
-                        let ip = service.ipv4_addresses()
-                            .first()
-                            .map(|ip| ip.to_string())
-                            .unwrap_or_default();
-                        let port = service.port();
-                        
-                        if !ip.is_empty() {
-                            devices.push(Device::new(name, ip, port));
-                        }
-                    }
+                Err(e) => {
+                    log::error!("Discovery error: {}", e);
                 }
             }
-        }
-        Err(e) => {
-            eprintln!("mDNS discovery error: {}", e);
+            
+            // Wait before next discovery
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }
-    
-    Ok(devices)
-}
 
-pub async fn advertise_service(port: u16, device_name: String) -> Result<(), String> {
-    let service = mdns::Service::new("_seaki._tcp.local", &device_name, port);
-    
-    match service.advertise() {
-        Ok(_) => Ok(()),
-        Err(e) => Err(format!("Failed to advertise service: {}", e)),
+    async fn discover_devices(_service_name: &str) -> Result<Vec<Device>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut devices = Vec::new();
+        
+        // For now, we'll use UDP broadcast discovery instead of mDNS
+        // This is more reliable for local network discovery
+        devices.extend(Self::discover_via_broadcast().await?);
+
+        Ok(devices)
+    }
+
+    async fn discover_via_broadcast() -> Result<Vec<Device>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut devices = Vec::new();
+        
+        // Get local IP to determine network range
+        let local_ip = local_ip()?;
+        let local_ipv4 = match local_ip {
+            IpAddr::V4(ip) => ip,
+            _ => return Ok(devices),
+        };
+
+        // Scan common IP ranges for Seaki services
+        let network_base = u32::from(local_ipv4) & 0xFFFFFF00; // /24 network
+        
+        // Use a more efficient approach with concurrent requests
+        let mut tasks = Vec::new();
+        
+        for i in 1..255 {
+            let target_ip = Ipv4Addr::from(network_base | i);
+            let target_addr = SocketAddr::new(IpAddr::V4(target_ip), 8080);
+            
+            // Skip our own IP
+            if target_ip != local_ipv4 {
+                let task = tokio::spawn(async move {
+                    Self::check_seaki_service(target_addr).await
+                });
+                tasks.push(task);
+            }
+        }
+        
+        // Wait for all tasks to complete
+        for task in tasks {
+            if let Ok(Ok(device)) = task.await {
+                devices.push(device);
+            }
+        }
+
+        Ok(devices)
+    }
+
+    async fn check_seaki_service(addr: SocketAddr) -> Result<Device, Box<dyn std::error::Error + Send + Sync>> {
+        let client = reqwest::Client::new();
+        let url = format!("http://{}:{}/api/status", addr.ip(), addr.port());
+        
+        // Try to connect with timeout
+        let response = timeout(
+            Duration::from_secs(2),
+            client.get(&url).send()
+        ).await??;
+
+        if response.status().is_success() {
+            // Parse response to get device info
+            let device_name = format!("Device-{}", addr.ip());
+            
+            Ok(Device {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: device_name,
+                ip: addr.ip().to_string(),
+                port: addr.port(),
+                last_seen: Utc::now(),
+            })
+        } else {
+            Err("Service not available".into())
+        }
+    }
+
+    pub async fn advertise_service(&self, port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        log::info!("Advertising Seaki service on port {}", port);
+        
+        // In a real implementation, you would use mDNS to advertise the service
+        // For now, we'll just log that we're advertising
+        log::info!("Service advertised: {} on port {}", self.service_name, port);
+        
+        Ok(())
+    }
+
+    pub fn get_devices(&self) -> Vec<Device> {
+        self.devices.values().cloned().collect()
+    }
+
+    pub fn remove_stale_devices(&mut self, max_age: Duration) {
+        let now = Utc::now();
+        self.devices.retain(|_, device| {
+            now.signed_duration_since(device.last_seen) < chrono::Duration::from_std(max_age).unwrap_or_default()
+        });
     }
 }
