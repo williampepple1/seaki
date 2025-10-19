@@ -60,7 +60,8 @@ async fn start_server(state: State<'_, AppState>) -> Result<String, String> {
         return Ok("Server is already running".to_string());
     }
     
-    let port = 8080;
+    // Use a specific weird port that's unlikely to be used by other applications
+    let port = 54321;
     let file_server = FileServer::new(port);
     
     // Start the server in a separate task
@@ -129,9 +130,18 @@ async fn send_file(device_ip: String, file_path: String, state: State<'_, AppSta
         .unwrap_or_else(|_| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
     let device_name = whoami::fallible::hostname().unwrap_or_else(|_| "Unknown Device".to_string());
     
+    // Get the current server port from state
+    let server_guard = state.server.lock().await;
+    let port = if let Some(server) = server_guard.as_ref() {
+        server.port
+    } else {
+        8080 // fallback port
+    };
+    drop(server_guard);
+    
     match file_handler.send_file_to_device(
         device_ip.clone(),
-        8080,
+        port,
         file_path.clone(),
         device_name,
         local_ip.to_string(),
@@ -146,6 +156,16 @@ async fn get_local_ip() -> Result<String, String> {
     match local_ip_address::local_ip() {
         Ok(ip) => Ok(ip.to_string()),
         Err(e) => Err(format!("Failed to get local IP: {}", e)),
+    }
+}
+
+#[tauri::command]
+async fn get_server_port(state: State<'_, AppState>) -> Result<u16, String> {
+    let server_guard = state.server.lock().await;
+    if let Some(server) = server_guard.as_ref() {
+        Ok(server.port)
+    } else {
+        Err("Server is not running".to_string())
     }
 }
 
@@ -218,6 +238,7 @@ fn main() {
             get_devices,
             send_file,
             get_local_ip,
+            get_server_port,
             get_pending_connections,
             get_pending_files,
             approve_connection,

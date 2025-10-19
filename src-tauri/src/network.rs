@@ -92,12 +92,15 @@ impl NetworkDiscovery {
         // Use a more efficient approach with concurrent requests
         let mut tasks = Vec::new();
         
+        // Scan for Seaki services on the specific weird port
+        let seaki_port = 54321;
+        
         for i in 1..255 {
             let target_ip = Ipv4Addr::from(network_base | i);
-            let target_addr = SocketAddr::new(IpAddr::V4(target_ip), 8080);
             
             // Skip our own IP
             if target_ip != local_ipv4 {
+                let target_addr = SocketAddr::new(IpAddr::V4(target_ip), seaki_port);
                 let task = tokio::spawn(async move {
                     Self::check_seaki_service(target_addr).await
                 });

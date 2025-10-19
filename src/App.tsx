@@ -35,6 +35,7 @@ function App() {
   const [isDiscovering, setIsDiscovering] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [localIp, setLocalIp] = useState<string>('');
+  const [serverPort, setServerPort] = useState<number | null>(null);
   const [message, setMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [progress, setProgress] = useState(0);
   const [pendingConnections, setPendingConnections] = useState<IncomingConnection[]>([]);
@@ -63,11 +64,21 @@ function App() {
     }
   };
 
+  const getServerPort = async () => {
+    try {
+      const port = await invoke<number>('get_server_port');
+      setServerPort(port);
+    } catch (error) {
+      setServerPort(null);
+    }
+  };
+
   const startServer = async () => {
     try {
       const result = await invoke<string>('start_server');
       setIsServerRunning(true);
       setMessage({ type: 'success', text: result });
+      getServerPort(); // Get the server port after starting
     } catch (error) {
       setMessage({ type: 'error', text: `Failed to start server: ${error}`});
     }
@@ -77,6 +88,7 @@ function App() {
     try {
       const result = await invoke<string>('stop_server');
       setIsServerRunning(false);
+      setServerPort(null);
       setMessage({ type: 'info', text: result });
     } catch (error) {
       setMessage({ type: 'error', text: `Failed to stop server: ${error}`});
@@ -205,11 +217,12 @@ function App() {
 
       <div className="card">
         <div className="status-bar">
-          <div className="status-indicator">
-            <div className={`status-dot ${isServerRunning ? '' : 'offline'}`}></div>
-            <span>{isServerRunning ? 'Server Running' : 'Server Offline'}</span>
-            {localIp && <span>({localIp})</span>}
-          </div>
+            <div className="status-indicator">
+              <div className={`status-dot ${isServerRunning ? '' : 'offline'}`}></div>
+              <span>{isServerRunning ? 'Server Running' : 'Server Offline'}</span>
+              {localIp && <span>({localIp})</span>}
+              {serverPort && <span>:{serverPort}</span>}
+            </div>
           <div className="buttons">
             {!isServerRunning ? (
               <button className="btn btn-primary" onClick={startServer}>
